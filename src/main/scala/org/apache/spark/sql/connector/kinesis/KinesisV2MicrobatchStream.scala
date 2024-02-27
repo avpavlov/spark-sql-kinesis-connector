@@ -253,7 +253,8 @@ class KinesisV2MicrobatchStream (
     }.toArray
 
     if (!options.avoidEmptyBatches
-      || prevBatchId < 0
+      || prevBatchId < 0 // new job started without previous checkpoint
+      || currentShardOffsets.isEmpty // job started resuming from previous checkpoint
       || hasUnfinishedAggregateRecord(latestShardInfo)
       || hasShardEndAsOffset(latestShardInfo)
       || ShardSyncer.hasNewShards(mergedPrevShardsInfo, latestShardInfo)
@@ -266,7 +267,7 @@ class KinesisV2MicrobatchStream (
                 latestShardInfo.filter(_.iteratorType != ShardEnd.iteratorType)
       ))
     } else {
-      logDebug(s"Offsets are unchanged since ${KinesisOptions.AVOID_EMPTY_BATCHES} is enabled")
+      logInfo(s"Offsets are unchanged since ${KinesisOptions.AVOID_EMPTY_BATCHES} is enabled")
     }
 
 
@@ -291,7 +292,7 @@ class KinesisV2MicrobatchStream (
     // 2. metadataLog(end.batchId) exist (include both partial and full exists): rerun uncommitted batch
     // For scenario 2, use the shardIds from metadataLog to create InputPartitions. so the restored batch will only process the shards in metadataLog
     // For both scenarios, start's shard info is not really used except the assert
-    logDebug(s"planInputPartitions is start $start, end $end")
+    logInfo(s"planInputPartitions is start $start, end $end")
     val currBatchShardOffset = KinesisV2SourceOffset.getShardOffsets(end)
     val currBatchId = currBatchShardOffset.batchId
     val prevBatchId: Long = if (start != null) {
@@ -299,6 +300,7 @@ class KinesisV2MicrobatchStream (
     } else {
       -1.toLong
     }
+    logInfo(s"prevBatchId $prevBatchId, currBatchId $currBatchId")
     assert(prevBatchId <= currBatchId)
 
     val currBatchShardsInfo = getBatchShardsInfo(currBatchId)
@@ -345,6 +347,7 @@ class KinesisV2MicrobatchStream (
   )
 
   override def initialOffset(): Offset = {
+    logInfo(s"initialOffset for ${options.streamName}")
     KinesisV2SourceOffset(new ShardOffsets(-1L, options.streamName))
   }
 
