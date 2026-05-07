@@ -754,6 +754,115 @@ class EfoRecordBatchPublisherSuite extends KinesisTestBase {
     count shouldBe 1
   }
 
+  test("Position advances using continuationSequenceNumber when records are empty but millisBehindLatest > 0") {
+    val continuationSeqNum = "49673654935242545803507381440401180139796212841567449938"
+    val event = SubscribeToShardEvent.builder
+      .records(java.util.Collections.emptyList[Record])
+      .millisBehindLatest(1000000L)
+      .continuationSequenceNumber(continuationSeqNum)
+      .build
+
+    val events = mutable.ArrayBuffer(event)
+    val kinesisClient = singleShardWithEvents(events)
+
+    val publisher = new EfoRecordBatchPublisher(
+      KinesisPosition.make(AtTimeStamp.iteratorType,
+        "1778094440502",
+        NO_SUB_SEQUENCE_NUMBER,
+        isLast = true
+      ),
+      DEFAULT_TEST_CONSUMER_ARN,
+      StreamShard(DEFAULT_TEST_STEAM_NAME, DEFAULT_TEST_SHARD),
+      kinesisClient,
+      DEFAULT_KINESIS_OPTIONS,
+      true)
+
+    publisher.runProcessLoop(new TestConsumer(publisher.initialStartingPosition))
+
+    // Position should advance to AFTER_SEQUENCE_NUMBER using the continuationSequenceNumber
+    publisher.nextStartingPosition.iteratorType shouldBe AfterSequenceNumber.iteratorType
+    publisher.nextStartingPosition.iteratorPosition shouldBe continuationSeqNum
+  }
+
+  test("Position does NOT advance when records are empty and millisBehindLatest is 0") {
+    val event = SubscribeToShardEvent.builder
+      .records(java.util.Collections.emptyList[Record])
+      .millisBehindLatest(0L)
+      .continuationSequenceNumber("some-seq-num")
+      .build
+
+    val events = mutable.ArrayBuffer(event)
+    val kinesisClient = singleShardWithEvents(events)
+
+    val publisher = new EfoRecordBatchPublisher(
+      KinesisPosition.make(AtTimeStamp.iteratorType,
+        "1778094440502",
+        NO_SUB_SEQUENCE_NUMBER,
+        isLast = true
+      ),
+      DEFAULT_TEST_CONSUMER_ARN,
+      StreamShard(DEFAULT_TEST_STEAM_NAME, DEFAULT_TEST_SHARD),
+      kinesisClient,
+      DEFAULT_KINESIS_OPTIONS,
+      true)
+
+    publisher.runProcessLoop(new TestConsumer(publisher.initialStartingPosition))
+
+    // Position should stay at AT_TIMESTAMP since we're caught up
+    publisher.nextStartingPosition.iteratorType shouldBe AtTimeStamp.iteratorType
+  }
+
+  test("Position does NOT advance when records are empty, millisBehindLatest > 0, but continuationSequenceNumber is null") {
+    val event = SubscribeToShardEvent.builder
+      .records(java.util.Collections.emptyList[Record])
+      .millisBehindLatest(500000L)
+      .continuationSequenceNumber(null)
+      .build
+
+    val events = mutable.ArrayBuffer(event)
+    val kinesisClient = singleShardWithEvents(events)
+
+    val publisher = new EfoRecordBatchPublisher(
+      KinesisPosition.make(AtTimeStamp.iteratorType,
+        "1778094440502",
+        NO_SUB_SEQUENCE_NUMBER,
+        isLast = true
+      ),
+      DEFAULT_TEST_CONSUMER_ARN,
+      StreamShard(DEFAULT_TEST_STEAM_NAME, DEFAULT_TEST_SHARD),
+      kinesisClient,
+      DEFAULT_KINESIS_OPTIONS,
+      true)
+
+    publisher.runProcessLoop(new TestConsumer(publisher.initialStartingPosition))
+
+    // Position should stay at AT_TIMESTAMP since continuationSequenceNumber is null
+    publisher.nextStartingPosition.iteratorType shouldBe AtTimeStamp.iteratorType
+  }
+
+  test("Position advances normally when records are non-empty regardless of millisBehindLatest") {
+    val kinesisClient = boundedShard
+      .withBatchCount(1)
+      .withBatchesPerSubscription(1)
+      .withRecordsPerBatch(5)
+      .withMillisBehindLatest(999999L)
+      .build
+
+    val publisher = createRecordBatchPublisher(kinesisClient,
+      KinesisPosition.make(AtTimeStamp.iteratorType,
+        "1778094440502",
+        NO_SUB_SEQUENCE_NUMBER,
+        isLast = true
+      )
+    )
+
+    publisher.runProcessLoop(new TestConsumer(publisher.initialStartingPosition))
+
+    // Position should advance to AFTER_SEQUENCE_NUMBER using the record's sequence number
+    publisher.nextStartingPosition.iteratorType shouldBe AfterSequenceNumber.iteratorType
+    publisher.nextStartingPosition.iteratorPosition shouldBe "5"
+  }
+
   private def flattenToUserRecords(recordBatch: util.List[RecordBatch]): Seq[KinesisUserRecord] = {
     recordBatch.asScala.flatMap(_.userRecords)
   }

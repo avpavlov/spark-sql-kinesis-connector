@@ -23,12 +23,15 @@ import software.amazon.awssdk.services.kinesis.model.SubscribeToShardEvent
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.connector.kinesis.FullJitterBackoffManager
 import org.apache.spark.sql.connector.kinesis.KinesisOptions
+import org.apache.spark.sql.connector.kinesis.AfterSequenceNumber
+import org.apache.spark.sql.connector.kinesis.AtTimeStamp
 import org.apache.spark.sql.connector.kinesis.KinesisPosition
 import org.apache.spark.sql.connector.kinesis.client.KinesisClientConsumer
 import org.apache.spark.sql.connector.kinesis.retrieval.RecordBatch
 import org.apache.spark.sql.connector.kinesis.retrieval.RecordBatchConsumer
 import org.apache.spark.sql.connector.kinesis.retrieval.RecordBatchPublisher
 import org.apache.spark.sql.connector.kinesis.retrieval.RecordBatchPublisherRunStatus._
+import org.apache.spark.sql.connector.kinesis.retrieval.SequenceNumber
 import org.apache.spark.sql.connector.kinesis.retrieval.StreamShard
 import org.apache.spark.sql.connector.kinesis.retrieval.efo.EfoRecordBatchPublisher.RECOVERABLE_RETRY_MULTIPLIER
 
@@ -57,7 +60,28 @@ class EfoRecordBatchPublisher (
       override def accept(event: SubscribeToShardEvent): Unit = {
         val recordBatch = RecordBatch (event.records.asScala, streamShard, event.millisBehindLatest)
         val sequenceNumber = recordBatchConsumer.accept (recordBatch)
-        nextStartingPosition = getNextStartingPosition (sequenceNumber, nextStartingPosition)
+
+        // When records are empty but millisBehindLatest > 0, the default behavior keeps
+        // the position at AT_TIMESTAMP sentinel which causes an infinite re-subscribe loop.
+        // Use continuationSequenceNumber from the event to advance past the empty region.
+        if (event.records.isEmpty
+            && event.millisBehindLatest > 0
+            && event.continuationSequenceNumber != null) {
+          logInfo(s"Advancing position using continuationSequenceNumber for ${streamShard} " +
+            s"(empty records with millisBehindLatest=${event.millisBehindLatest}). " +
+            s"New position: AFTER_SEQUENCE_NUMBER ${event.continuationSequenceNumber}")
+          nextStartingPosition = new AfterSequenceNumber(
+            event.continuationSequenceNumber, -1, true)
+        } else if (!event.records.isEmpty) {
+          nextStartingPosition = getNextStartingPosition(sequenceNumber, nextStartingPosition)
+        } else {
+          // Records are empty and millisBehindLatest == 0 (or continuationSequenceNumber is null).
+          // Only call getNextStartingPosition if the sequence number is not the AT_TIMESTAMP
+          // sentinel, which would trigger an assert when nextStartingPosition has already advanced.
+          if (sequenceNumber != SequenceNumber.SENTINEL_AT_TIMESTAMP_SEQUENCE_NUM) {
+            nextStartingPosition = getNextStartingPosition(sequenceNumber, nextStartingPosition)
+          }
+        }
       }}
 
     val result = runWithBackoff(eventConsumer)
