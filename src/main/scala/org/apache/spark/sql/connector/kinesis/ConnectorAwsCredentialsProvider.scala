@@ -17,14 +17,18 @@
 package org.apache.spark.sql.connector.kinesis
 
 import java.net.URI
+import java.nio.file.{Files, Paths}
 
+import software.amazon.awssdk.auth.credentials.AwsCredentials
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider
-import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider
+import software.amazon.awssdk.auth.credentials.AwsSessionCredentials
 import software.amazon.awssdk.http.apache.ApacheHttpClient
 import software.amazon.awssdk.regions.Region
 import software.amazon.awssdk.services.sts.StsClient
 import software.amazon.awssdk.services.sts.auth.StsAssumeRoleCredentialsProvider
 import software.amazon.awssdk.services.sts.model.AssumeRoleRequest
+
+import org.apache.spark.internal.Logging
 
 /**
  * Serializable interface providing a method executors can call to obtain an
@@ -37,21 +41,79 @@ sealed trait ConnectorAwsCredentialsProvider extends Serializable {
 
 case class ConnectorDefaultCredentialsProvider() extends ConnectorAwsCredentialsProvider {
 
-  private var providerOpt: Option[DefaultCredentialsProvider] = None
-  override def provider: AwsCredentialsProvider = {
-    if (providerOpt.isEmpty) {
-      providerOpt = Some(
-        // create a new DefaultCredentialsProvider
-        DefaultCredentialsProvider.builder().build()
-      )
-    }
+  private val CREDENTIALS_FILE = "/home/hadoop/.aws/credentials"
+  private val CACHE_DURATION_MS = 10 * 60 * 1000L // 10 minutes
 
-    providerOpt.get
+  private val cachedProvider = new FileCredentialsProvider(CREDENTIALS_FILE, CACHE_DURATION_MS)
+
+  override def provider: AwsCredentialsProvider = cachedProvider
+
+  override def close(): Unit = {}
+}
+
+/**
+ * Reads AWS credentials from a file, caches them for a configurable duration,
+ * then re-reads. Failed reads do not clear previously cached credentials.
+ */
+class FileCredentialsProvider(
+    filePath: String,
+    cacheDurationMs: Long
+) extends AwsCredentialsProvider with Logging with Serializable {
+
+  @volatile private var cachedCredentials: AwsCredentials = tryReadFile().getOrElse(
+    throw new RuntimeException(s"Failed to read credentials from $filePath on initialization")
+  )
+  @volatile private var lastReadTime: Long = System.currentTimeMillis()
+
+  override def resolveCredentials(): AwsCredentials = {
+    val now = System.currentTimeMillis()
+    if ((now - lastReadTime) > cacheDurationMs) {
+      tryReadFile() match {
+        case Some(creds) =>
+          cachedCredentials = creds
+          lastReadTime = now
+        case None =>
+          logWarning(s"Failed to read credentials from $filePath, using cached credentials")
+      }
+    }
+    cachedCredentials
   }
 
-  override def close(): Unit = {
-    tryAndIgnoreError("close default credential provider")  {
-      providerOpt.foreach(_.close())
+  private def tryReadFile(): Option[AwsCredentials] = {
+    try {
+      val path = Paths.get(filePath)
+      if (!Files.exists(path)) {
+        logWarning(s"Credentials file does not exist: $filePath")
+        return None
+      }
+      val lines = new String(Files.readAllBytes(path), "UTF-8").split("\n")
+      var accessKey: String = null
+      var secretKey: String = null
+      var sessionToken: String = null
+
+      lines.foreach { line =>
+        val trimmed = line.trim
+        if (trimmed.startsWith("aws_access_key_id")) {
+          accessKey = trimmed.split("=", 2).last.trim
+        } else if (trimmed.startsWith("aws_secret_access_key")) {
+          secretKey = trimmed.split("=", 2).last.trim
+        } else if (trimmed.startsWith("aws_session_token")) {
+          sessionToken = trimmed.split("=", 2).last.trim
+        }
+      }
+
+      if (accessKey == null || secretKey == null) {
+        logWarning(s"Credentials file $filePath missing access key or secret key")
+        None
+      } else if (sessionToken != null) {
+        Some(AwsSessionCredentials.create(accessKey, secretKey, sessionToken))
+      } else {
+        Some(software.amazon.awssdk.auth.credentials.AwsBasicCredentials.create(accessKey, secretKey))
+      }
+    } catch {
+      case e: Exception =>
+        logWarning(s"Error reading credentials file $filePath: ${e.getMessage}")
+        None
     }
   }
 }
