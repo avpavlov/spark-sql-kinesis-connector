@@ -90,6 +90,7 @@ class FileCredentialsProvider(
       var accessKey: String = null
       var secretKey: String = null
       var sessionToken: String = null
+      var expiration: String = null
 
       lines.foreach { line =>
         val trimmed = line.trim
@@ -99,6 +100,8 @@ class FileCredentialsProvider(
           secretKey = trimmed.split("=", 2).last.trim
         } else if (trimmed.startsWith("aws_session_token")) {
           sessionToken = trimmed.split("=", 2).last.trim
+        } else if (trimmed.startsWith("expiration")) {
+          expiration = trimmed.split("=", 2).last.trim
         }
       }
 
@@ -106,8 +109,10 @@ class FileCredentialsProvider(
         logWarning(s"Credentials file $filePath missing access key or secret key")
         None
       } else if (sessionToken != null) {
+        logInfo(s"Credentials reloaded from $filePath, expiration=$expiration")
         Some(AwsSessionCredentials.create(accessKey, secretKey, sessionToken))
       } else {
+        logInfo(s"Credentials reloaded from $filePath (basic credentials, no expiration)")
         Some(software.amazon.awssdk.auth.credentials.AwsBasicCredentials.create(accessKey, secretKey))
       }
     } catch {
